@@ -1,0 +1,2363 @@
+
+
+# ===== FILE: app.py =====
+
+import streamlit as st
+import pandas as pd
+from datetime import datetime, timedelta
+import json
+from pathlib import Path
+
+from core.session import UpstoxSession
+from data.upstox_client import UpstoxClient
+from data.instrument_master import get_option_keys
+from core.feature_pipeline import build_and_store_features
+from core.scheduler import MarketScheduler
+from core.signals.state_machine import SignalStateMachine
+from features.breadth import build_constituents_df
+from ml.feature_contract import FEATURE_VERSION
+
+
+from storage.repository import (
+    fetch_latest_features,
+    insert_signal,
+    signal_exists,
+    validate_new_signals,
+    expire_old_signals
+)
+
+# ==============================
+# STREAMLIT CONFIG
+# ==============================
+
+st.set_page_config(page_title="Trading Tool", layout="wide")
+st.title("📈 Trading Tool – Live Feature Engine")
+
+# ==============================
+# AUTHENTICATION (STRICT)
+# ==============================
+
+access_token = UpstoxSession.authenticate()
+if not access_token:
+    st.error("Authentication failed")
+    st.stop()
+
+client = UpstoxClient(access_token)
+
+# ==============================
+# SCHEDULER (SINGLETON)
+# ==============================
+
+if "scheduler" not in st.session_state:
+    st.session_state.scheduler = MarketScheduler(interval_seconds=30)
+
+scheduler: MarketScheduler = st.session_state.scheduler
+
+# ==============================
+# SIGNAL ENGINE (SINGLETON)
+# ==============================
+
+if "signal_engine" not in st.session_state:
+    st.session_state.signal_engine = SignalStateMachine(
+        signal_expiry_minutes=5
+    )
+
+signal_engine: SignalStateMachine = st.session_state.signal_engine
+
+# ==============================
+# CONFIG
+# ==============================
+
+INDEX_SYMBOL = "NSE_INDEX|Nifty 50"
+UNDERLYING = "NIFTY"
+EXPIRY_DATE = datetime.utcnow() + timedelta(days=3)
+
+INSTRUMENT_MASTER = Path("G:/trading_app/data/instruments.json.gz")
+if not INSTRUMENT_MASTER.exists():
+    st.error("Instrument master not found")
+    st.stop()
+
+# ==============================
+# STATE INITIALIZATION
+# ==============================
+
+for key in ["price_series", "volume_series", "ccc_history"]:
+    if key not in st.session_state:
+        st.session_state[key] = pd.Series(dtype=float)
+
+# ==============================
+# LOAD NIFTY WEIGHTS (ONCE)
+# ==============================
+
+if "nifty_weights" not in st.session_state:
+    with open("config/nifty_weights.json", "r") as f:
+        st.session_state.nifty_weights = json.load(f)
+
+# ==============================
+# SAFE FEATURE FETCH
+# ==============================
+
+def get_latest_feature_row():
+    df = fetch_latest_features(FEATURE_VERSION)
+    if df is None or df.empty:
+        return None
+    return df.iloc[0]
+
+# ==============================
+# EXECUTION CYCLE
+# ==============================
+
+def run_cycle():
+    """
+    Single deterministic execution cycle.
+    Must be safe to call multiple times.
+    """
+
+    # ------------------------------
+    # INDEX QUOTE
+    # ------------------------------
+
+    index_data = client.fetch_index_quote(INDEX_SYMBOL)
+    if not index_data or index_data.get("ltp") is None:
+        return
+
+    ltp = float(index_data["ltp"])
+    open_price = float(index_data["open"])
+    volume = 0.0  # index has no volume
+
+    # ------------------------------
+    # UPDATE SERIES
+    # ------------------------------
+
+    st.session_state.price_series = pd.concat(
+        [st.session_state.price_series, pd.Series([ltp])]
+    ).tail(200)
+
+    st.session_state.volume_series = pd.concat(
+        [st.session_state.volume_series, pd.Series([volume])]
+    ).tail(200)
+
+    # ------------------------------
+    # REAL CCC INGESTION
+    # ------------------------------
+
+    equity_quotes_df = client.fetch_equity_quotes(
+        symbols=list(st.session_state.nifty_weights.keys())
+    )
+
+    constituents_df = build_constituents_df(
+        equity_quotes_df=equity_quotes_df,
+        weights=st.session_state.nifty_weights
+    )
+
+    if not constituents_df.empty:
+        ccc_value = (
+            constituents_df["weight"] * constituents_df["price_change"]
+        ).sum()
+    else:
+        ccc_value = 0.0
+
+    st.session_state.ccc_history = pd.concat(
+        [st.session_state.ccc_history, pd.Series([ccc_value])]
+    ).tail(200)
+
+    # ------------------------------
+    # OPTION INSTRUMENT DISCOVERY (LOCAL)
+    # ------------------------------
+
+    if "option_keys" not in st.session_state:
+        st.session_state.option_keys = get_option_keys(
+            underlying=UNDERLYING,
+            expiry=EXPIRY_DATE.strftime("%Y-%m-%d"),
+            max_keys=200
+        )
+
+    if not st.session_state.option_keys:
+        return
+
+    # ------------------------------
+    # OPTION CHAIN FETCH
+    # ------------------------------
+
+    option_chain_df = client.fetch_option_chain(
+        st.session_state.option_keys
+    )
+
+    # ------------------------------
+    # FEATURE PIPELINE (SCHEDULER TIME)
+    # ------------------------------
+
+    snapshot_ts = pd.Timestamp.utcnow().floor("ms")
+
+    build_and_store_features(
+        timestamp=snapshot_ts,
+        option_chain_df=option_chain_df,
+        spot_price=ltp,
+        expiry_datetime=EXPIRY_DATE,
+
+        ltp=ltp,
+        vwap=open_price,
+        price_series=st.session_state.price_series,
+        volume_series=st.session_state.volume_series,
+
+        constituents_df=constituents_df,
+        ccc_history=st.session_state.ccc_history
+    )
+
+
+
+    # ------------------------------
+    # SIGNAL GENERATION
+    # ------------------------------
+
+    feature_row = get_latest_feature_row()
+    if feature_row is None:
+        return
+
+    if signal_exists(feature_row["timestamp"]):
+        return
+
+    signal = signal_engine.build_signal(feature_row)
+
+    if signal["signal_type"] != "NEUTRAL":
+        insert_signal(signal)
+
+    # ------------------------------
+    # SIGNAL LIFECYCLE
+    # ------------------------------
+
+    validate_new_signals(confidence_threshold=0.2)
+    expire_old_signals()
+
+# ==============================
+# SCHEDULER INVOCATION
+# ==============================
+
+cycle_executed = scheduler.run_if_due(run_cycle)
+
+# ==============================
+# MANUAL DEBUG TRIGGER (TEMP)
+# ==============================
+
+if st.button("Force Data Capture (Debug)"):
+    run_cycle()
+    st.success("run_cycle() executed manually")
+
+# ==============================
+# UI (READ ONLY)
+# ==============================
+
+st.subheader("System Status")
+
+c1, c2, c3 = st.columns(3)
+
+with c1:
+    st.metric("Scheduler Interval", "30s")
+
+with c2:
+    st.metric("Cycle Executed", "Yes" if cycle_executed else "No")
+
+with c3:
+    latest = fetch_latest_features(FEATURE_VERSION)
+    if latest is not None and not latest.empty:
+        st.metric("Last Feature Time", latest.iloc[0]["timestamp"])
+    else:
+        st.metric("Last Feature Time", "—")
+
+# ==============================
+# FEATURES
+# ==============================
+
+st.subheader("Latest Stored Features")
+
+if latest is not None and not latest.empty:
+    st.dataframe(latest, width="stretch")
+else:
+    st.info("No features stored yet")
+
+# ==============================
+# SIGNALS
+# ==============================
+
+st.subheader("Active Signals")
+
+import sqlite3
+db = Path("G:/trading_app/storage/trading.db")
+
+with sqlite3.connect(db) as conn:
+    signals_df = pd.read_sql(
+        """
+        SELECT *
+        FROM signals
+        WHERE status IN ('NEW','VALIDATED')
+        ORDER BY created_at DESC
+        LIMIT 5
+        """,
+        conn
+    )
+
+if not signals_df.empty:
+    st.dataframe(signals_df, width="stretch")
+else:
+    st.info("No active signals")
+
+# ==============================
+# PRICE CHART
+# ==============================
+
+if len(st.session_state.price_series) > 1:
+    st.subheader("Index Price (Session)")
+    st.line_chart(
+        pd.DataFrame({"price": st.session_state.price_series.values}),
+        width="stretch"
+    )
+
+
+# ===== FILE: quick_test.py =====
+
+import requests
+import json
+
+def quick_test():
+    """Quick test with the working format"""
+    
+    ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJBRjY1NzAiLCJqdGkiOiI2OTc1ZmJlNjg5M2Y0MDY1MjE3YmUwZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2OTMzOTg3OCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY5Mzc4NDAwfQ.eEUnBABSTpvvTaHTmn8Ms9bmixB-LKkcGENrTdKIp_A"
+    
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
+    
+    # ONLY THIS FORMAT WORKS
+    symbols = [
+        "NSE_INDEX|Nifty 50",
+        "NSE_INDEX|Nifty Bank",
+        "NSE_INDEX|Nifty Next 50"
+    ]
+    
+    for symbol in symbols:
+        print(f"\n{'='*50}")
+        print(f"Testing: {symbol}")
+        
+        response = requests.get(
+            "https://api.upstox.com/v2/market-quote/quotes",
+            params={"symbol": symbol},
+            headers=headers,
+            timeout=10
+        )
+        
+        print(f"Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                # Response key uses colon, not pipe
+                response_key = symbol.replace("|", ":")
+                quote = data["data"].get(response_key, {})
+                
+                print(f"✓ SUCCESS!")
+                print(f"  LTP: {quote.get('last_price')}")
+                print(f"  Open: {quote.get('ohlc', {}).get('open')}")
+                print(f"  High: {quote.get('ohlc', {}).get('high')}")
+                print(f"  Low: {quote.get('ohlc', {}).get('low')}")
+                print(f"  Close: {quote.get('ohlc', {}).get('close')}")
+            else:
+                print(f"✗ API Error: {data.get('errors')}")
+        else:
+            print(f"✗ HTTP Error: {response.text}")
+
+if __name__ == "__main__":
+    quick_test()
+
+# ===== FILE: test_simple.py =====
+
+import requests
+import json
+
+def test_with_live_token():
+    """Test with token from your UpstoxSession"""
+    
+    # Import your UpstoxSession to get a fresh token
+    try:
+        from core.session import UpstoxSession
+        access_token = UpstoxSession.authenticate()
+        
+        if not access_token:
+            print("❌ Could not get access token")
+            return
+        
+        print(f"✅ Got token: {access_token[:30]}...")
+        
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        }
+        
+        # Test the working format
+        symbol = "NSE_INDEX|Nifty 50"
+        
+        response = requests.get(
+            "https://api.upstox.com/v2/market-quote/quotes",
+            params={"symbol": symbol},
+            headers=headers,
+            timeout=10
+        )
+        
+        print(f"\nStatus: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("status") == "success":
+                # Response key uses colon, not pipe
+                response_key = symbol.replace("|", ":")
+                quote = data["data"].get(response_key, {})
+                
+                print("✅ SUCCESS!")
+                print(f"Symbol: {symbol}")
+                print(f"LTP: {quote.get('last_price')}")
+                print(f"Open: {quote.get('ohlc', {}).get('open')}")
+                print(f"High: {quote.get('ohlc', {}).get('high')}")
+                print(f"Low: {quote.get('ohlc', {}).get('low')}")
+                print(f"Close: {quote.get('ohlc', {}).get('close')}")
+                print(f"Change: {quote.get('net_change')}")
+            else:
+                print(f"❌ API Error: {data}")
+        else:
+            print(f"❌ HTTP Error: {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+if __name__ == "__main__":
+    test_with_live_token()
+
+# ===== FILE: upstox_test.py =====
+
+import requests
+import json
+
+def test_upstox_api():
+    # Replace with your actual access token
+    ACCESS_TOKEN = "YOUR_ACCESS_TOKEN_HERE"
+    
+    # Test different endpoints
+    endpoints = [
+        {
+            "name": "index-quote (POST)",
+            "url": "https://api.upstox.com/v2/market-quote/index-quote",
+            "method": "POST",
+            "data": {"index_key": "NIFTY 50"}
+        },
+        {
+            "name": "quote (GET with symbol)",
+            "url": "https://api.upstox.com/v2/market-quote/quote",
+            "method": "GET",
+            "params": {"symbol": "NIFTY 50"}
+        },
+        {
+            "name": "quote (GET with NSE_INDEX)",
+            "url": "https://api.upstox.com/v2/market-quote/quote",
+            "method": "GET",
+            "params": {"symbol": "NSE_INDEX|Nifty 50"}
+        }
+    ]
+    
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
+    
+    for endpoint in endpoints:
+        print(f"\n{'='*50}")
+        print(f"Testing: {endpoint['name']}")
+        print(f"URL: {endpoint['url']}")
+        
+        try:
+            if endpoint["method"] == "POST":
+                response = requests.post(
+                    endpoint["url"],
+                    json=endpoint.get("data"),
+                    headers=headers,
+                    timeout=10
+                )
+            else:
+                response = requests.get(
+                    endpoint["url"],
+                    params=endpoint.get("params"),
+                    headers=headers,
+                    timeout=10
+                )
+            
+            print(f"Status Code: {response.status_code}")
+            print(f"Response Headers: {dict(response.headers)}")
+            
+            if response.status_code == 200:
+                print("Success!")
+                data = response.json()
+                print(f"Response Keys: {data.keys() if isinstance(data, dict) else 'Not a dict'}")
+                print(f"Response Preview: {json.dumps(data, indent=2)[:500]}...")
+            else:
+                print(f"Error: {response.text}")
+                
+        except Exception as e:
+            print(f"Exception: {e}")
+
+if __name__ == "__main__":
+    test_upstox_api()
+
+# ===== FILE: upstox_test_fixed.py =====
+
+import requests
+import json
+from datetime import datetime
+
+
+def test_upstox_api_fixed(access_token: str):
+    """Test the actual working endpoints"""
+    
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    
+    # Test endpoints based on actual Upstox documentation
+    test_cases = [
+        {
+            "name": "GET quotes (main endpoint)",
+            "method": "GET",
+            "url": "https://api.upstox.com/v2/market-quote/quotes",
+            "params": {"symbol": "NIFTY 50"}
+        },
+        {
+            "name": "GET quotes with NSE_INDEX",
+            "method": "GET",
+            "url": "https://api.upstox.com/v2/market-quote/quotes",
+            "params": {"symbol": "NSE_INDEX|Nifty 50"}
+        },
+        {
+            "name": "GET quotes - NIFTY BANK",
+            "method": "GET",
+            "url": "https://api.upstox.com/v2/market-quote/quotes",
+            "params": {"symbol": "NIFTY BANK"}
+        },
+        {
+            "name": "GET quotes - BANKNIFTY",
+            "method": "GET",
+            "url": "https://api.upstox.com/v2/market-quote/quotes",
+            "params": {"symbol": "BANKNIFTY"}
+        },
+        {
+            "name": "GET quotes - multiple symbols",
+            "method": "GET",
+            "url": "https://api.upstox.com/v2/market-quote/quotes",
+            "params": {"symbol": "NIFTY 50,NIFTY BANK"}
+        }
+    ]
+    
+    print(f"\n{'='*60}")
+    print(f"Upstox API Test - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Token preview: {access_token[:30]}...")
+    print('='*60)
+    
+    for test in test_cases:
+        print(f"\n{'='*50}")
+        print(f"Test: {test['name']}")
+        print(f"URL: {test['url']}")
+        print(f"Params: {test.get('params')}")
+        
+        try:
+            if test["method"] == "GET":
+                response = requests.get(
+                    test["url"],
+                    params=test.get("params"),
+                    headers=headers,
+                    timeout=10
+                )
+            else:
+                response = requests.post(
+                    test["url"],
+                    json=test.get("data"),
+                    headers=headers,
+                    timeout=10
+                )
+            
+            print(f"Status Code: {response.status_code}")
+            
+            if response.status_code == 200:
+                print("✅ SUCCESS!")
+                data = response.json()
+                
+                # Pretty print the response structure
+                print("\nResponse Structure:")
+                print(f"Status: {data.get('status')}")
+                
+                if data.get("status") == "success":
+                    data_dict = data.get("data", {})
+                    print(f"Number of symbols returned: {len(data_dict)}")
+                    
+                    for key, value in data_dict.items():
+                        print(f"\nSymbol: {key}")
+                        print(f"  Last Price: {value.get('last_price')}")
+                        print(f"  Change: {value.get('change')}")
+                        
+                        ohlc = value.get("ohlc", {})
+                        print(f"  OHLC: {ohlc.get('open')}/{ohlc.get('high')}/{ohlc.get('low')}/{ohlc.get('close')}")
+                        
+                        # Just show first symbol details
+                        break
+                else:
+                    print(f"Error in response: {data}")
+                    
+            elif response.status_code == 401:
+                print("❌ 401 UNAUTHORIZED - Invalid token")
+                print(f"Response: {response.text}")
+                print("\n⚠️  TOKEN ISSUE DETECTED!")
+                print("Your access token is invalid or expired.")
+                print("Please regenerate your token from Upstox Developer Console.")
+                
+            elif response.status_code == 400:
+                print("❌ 400 BAD REQUEST")
+                print(f"Response: {response.text}")
+                
+            else:
+                print(f"❌ Error {response.status_code}")
+                print(f"Response: {response.text[:200]}...")
+                
+        except Exception as e:
+            print(f"❌ Exception: {e}")
+
+
+if __name__ == "__main__":
+    # Replace with your actual token
+    ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiJBRjY1NzAiLCJqdGkiOiI2OTc1ZmJlNjg5M2Y0MDY1MjE3YmUwZWQiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc2OTMzOTg3OCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzY5Mzc4NDAwfQ.eEUnBABSTpvvTaHTmn8Ms9bmixB-LKkcGENrTdKIp_A"
+    
+    if ACCESS_TOKEN.startswith("eyJ0eXAiOiJKV1Qi"):
+        test_upstox_api_fixed(ACCESS_TOKEN)
+    else:
+        print("Please update the ACCESS_TOKEN variable with your actual token")
+
+# ===== FILE: backtest\engine.py =====
+
+import sqlite3
+import pandas as pd
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from core.signals.state_machine import SignalStateMachine
+
+
+DB_PATH = Path("G:/trading_app/storage/trading.db")
+
+
+class BacktestEngine:
+    """
+    Replays historical features to simulate signals and trades.
+    """
+
+    def __init__(
+        self,
+        feature_version: str,
+        holding_minutes: int = 5,
+        quantity: int = 1
+    ):
+        self.feature_version = feature_version
+        self.holding_minutes = holding_minutes
+        self.quantity = quantity
+        self.signal_engine = SignalStateMachine(signal_expiry_minutes=holding_minutes)
+
+    # ==============================
+    # LOAD HISTORICAL FEATURES
+    # ==============================
+
+    def load_features(self) -> pd.DataFrame:
+        with sqlite3.connect(DB_PATH) as conn:
+            df = pd.read_sql(
+                """
+                SELECT *
+                FROM market_features
+                WHERE feature_version = ?
+                ORDER BY timestamp
+                """,
+                conn,
+                params=(self.feature_version,)
+            )
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        return df
+
+    # ==============================
+    # RUN BACKTEST
+    # ==============================
+
+    def run(self) -> pd.DataFrame:
+        df = self.load_features()
+        if df.empty:
+            raise RuntimeError("No features found for backtest")
+
+        trades = []
+        open_trade = None
+
+        for i in range(len(df) - 1):
+            row = df.iloc[i]
+            next_row = df.iloc[i + 1]
+
+            # If no open trade → check for signal
+            if open_trade is None:
+                signal = self.signal_engine.build_signal(row)
+
+                if signal["signal_type"] in ("BUY", "SELL"):
+                    open_trade = {
+                        "signal_id": signal["signal_id"],
+                        "direction": signal["signal_type"],
+                        "entry_time": next_row["timestamp"],
+                        "entry_price": next_row["spot_price"],
+                        "expiry_time": next_row["timestamp"]
+                                       + timedelta(minutes=self.holding_minutes)
+                    }
+
+            # If trade open → check exit
+            if open_trade is not None:
+                if next_row["timestamp"] >= open_trade["expiry_time"]:
+                    exit_price = next_row["spot_price"]
+
+                    pnl = (
+                        (exit_price - open_trade["entry_price"])
+                        if open_trade["direction"] == "BUY"
+                        else (open_trade["entry_price"] - exit_price)
+                    ) * self.quantity
+
+                    trades.append({
+                        "signal_id": open_trade["signal_id"],
+                        "entry_time": open_trade["entry_time"],
+                        "exit_time": next_row["timestamp"],
+                        "entry_price": open_trade["entry_price"],
+                        "exit_price": exit_price,
+                        "quantity": self.quantity,
+                        "pnl": pnl
+                    })
+
+                    open_trade = None
+
+        return pd.DataFrame(trades)
+
+
+# ===== FILE: backtest\metrics.py =====
+
+import pandas as pd
+import numpy as np
+
+
+def compute_backtest_metrics(trades_df: pd.DataFrame) -> dict:
+    """
+    Compute performance metrics from backtest trades.
+    Safe for empty DataFrames.
+    """
+
+    if trades_df is None or trades_df.empty:
+        return {
+            "total_trades": 0,
+            "win_rate": 0.0,
+            "total_pnl": 0.0,
+            "avg_pnl": 0.0,
+            "max_drawdown": 0.0,
+            "sharpe": 0.0,
+            "expectancy": 0.0
+        }
+
+    pnl = trades_df["pnl"]
+
+    total_trades = len(pnl)
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
+
+    win_rate = len(wins) / total_trades if total_trades else 0.0
+    total_pnl = pnl.sum()
+    avg_pnl = pnl.mean()
+
+    # Equity curve
+    equity = pnl.cumsum()
+    running_max = equity.cummax()
+    drawdown = equity - running_max
+    max_drawdown = drawdown.min()
+
+    # Sharpe (PnL-based)
+    sharpe = 0.0
+    if pnl.std() != 0:
+        sharpe = (pnl.mean() / pnl.std()) * np.sqrt(len(pnl))
+
+    # Expectancy
+    avg_win = wins.mean() if not wins.empty else 0.0
+    avg_loss = losses.mean() if not losses.empty else 0.0
+    expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
+
+    return {
+        "total_trades": total_trades,
+        "win_rate": round(win_rate, 3),
+        "total_pnl": round(total_pnl, 2),
+        "avg_pnl": round(avg_pnl, 2),
+        "max_drawdown": round(max_drawdown, 2),
+        "sharpe": round(sharpe, 3),
+        "expectancy": round(expectancy, 2)
+    }
+
+
+# ===== FILE: backtest\run_backtest.py =====
+
+from backtest.engine import BacktestEngine
+from backtest.metrics import compute_backtest_metrics
+from ml.feature_contract import FEATURE_VERSION
+
+engine = BacktestEngine(
+    feature_version=FEATURE_VERSION,
+    holding_minutes=5,
+    quantity=1
+)
+
+results = engine.run()
+metrics = compute_backtest_metrics(results)
+
+print("Backtest Results:")
+print(results)
+
+print("\nBacktest Metrics:")
+for k, v in metrics.items():
+    print(f"{k}: {v}")
+
+
+# ===== FILE: backtest\__init__.py =====
+
+
+
+# ===== FILE: core\feature_pipeline.py =====
+
+import pandas as pd
+from ml.feature_contract import FEATURE_VERSION, FEATURE_COLUMNS
+from storage.repository import insert_market_features
+
+from features.option_features import compute_option_features
+from features.price_features import compute_price_features
+from features.breadth import compute_breadth_features
+
+
+def build_and_store_features(
+    *,
+    print("FEATURE PIPELINE FILE:", __file__)
+    timestamp: pd.Timestamp,
+    option_chain_df: pd.DataFrame,
+    spot_price: float,
+    expiry_datetime,
+    ltp: float,
+    vwap: float,
+    price_series: pd.Series,
+    volume_series: pd.Series,
+    constituents_df: pd.DataFrame,
+    ccc_history: pd.Series
+) -> None:
+    """
+    Append exactly ONE immutable feature row.
+    Contract-safe, schema-safe, append-only.
+    """
+
+    # ------------------------------
+    # TIMESTAMP (EXPLICIT)
+    # ------------------------------
+    if not isinstance(timestamp, pd.Timestamp):
+        raise TypeError("timestamp must be pandas.Timestamp")
+
+    timestamp_str = timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+    # ------------------------------
+    # FEATURE COMPUTATION
+    # ------------------------------
+    option_feats = compute_option_features(option_chain_df, spot_price)
+    price_feats = compute_price_features(ltp, vwap, price_series, volume_series)
+    breadth_feats = compute_breadth_features(constituents_df, ccc_history)
+
+    # ------------------------------
+    # STRICT FEATURE CONTRACT
+    # ------------------------------
+    feature_row = {
+        "timestamp": timestamp_str,
+        "feature_version": FEATURE_VERSION,
+        "future_return_5m": None
+    }
+
+    # Fill ALL required feature columns explicitly
+    for col in FEATURE_COLUMNS:
+        if col == "timestamp":
+            continue
+        feature_row[col] = (
+            option_feats.get(col)
+            or price_feats.get(col)
+            or breadth_feats.get(col)
+            or 0.0
+        )
+
+    feature_row["time_to_expiry_minutes"] = int(
+        (expiry_datetime - timestamp).total_seconds() / 60
+    )
+
+    # ------------------------------
+    # PERSIST (SINGLE PATH)
+    # ------------------------------
+    df = pd.DataFrame([feature_row], columns=FEATURE_COLUMNS + ["feature_version", "future_return_5m"])
+    print("FEATURE DF SHAPE:", df.shape)
+    print("FEATURE DF COLUMNS:", list(df.columns))
+    print("FEATURE DF NULLS:\n", df.isnull().sum())
+
+    assert not df.empty, "Feature DataFrame is empty"
+    assert not df.isnull().any().any(), "NULLs found in feature DataFrame"
+
+    insert_market_features(df)
+
+
+
+# ===== FILE: core\scheduler.py =====
+
+from datetime import datetime, time as dtime
+from typing import Callable, Optional
+import threading
+
+
+class MarketScheduler:
+    """
+    Controls execution cadence independent of UI.
+
+    Usage:
+        scheduler = MarketScheduler(interval_seconds=30)
+        scheduler.run_if_due(run_cycle)
+    """
+
+    def __init__(
+        self,
+        interval_seconds: int = 30,
+        market_open: dtime = dtime(9, 15),
+        market_close: dtime = dtime(15, 30)
+    ):
+        self.interval_seconds = interval_seconds
+        self.market_open = market_open
+        self.market_close = market_close
+
+        self._last_run: Optional[datetime] = None
+        self._lock = threading.Lock()
+
+    # ==============================
+    # TIME GUARDS
+    # ==============================
+
+    def _is_market_open(self, now: datetime) -> bool:
+        t = now.time()
+        return self.market_open <= t <= self.market_close
+
+    def _is_due(self, now: datetime) -> bool:
+        if self._last_run is None:
+            return True
+
+        delta = (now - self._last_run).total_seconds()
+        return delta >= self.interval_seconds
+
+    # ==============================
+    # PUBLIC ENTRYPOINT
+    # ==============================
+
+    def run_if_due(self, run_cycle: Callable[[], None]) -> bool:
+        """
+        Executes run_cycle() if:
+        - market is open
+        - interval has elapsed
+        - not already running
+
+        Returns:
+            True  -> cycle executed
+            False -> skipped
+        """
+
+        now = datetime.now()
+
+        # Market closed → skip silently
+        if not self._is_market_open(now):
+            return False
+
+        # Not time yet → skip
+        if not self._is_due(now):
+            return False
+
+        # Thread-safe execution
+        with self._lock:
+            # Double-check inside lock
+            if not self._is_due(now):
+                return False
+
+            try:
+                run_cycle()
+                self._last_run = now
+                return True
+            except Exception as e:
+                # Do NOT advance last_run on failure
+                raise e
+
+
+# ===== FILE: core\session.py =====
+
+import requests
+import streamlit as st
+from urllib.parse import urlencode
+from typing import Optional
+
+# ==============================
+# CONFIG (EDIT THESE)
+# ==============================
+
+UPSTOX_AUTH_URL = "https://api.upstox.com/v2/login/authorization/dialog"
+UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
+
+CLIENT_ID = st.secrets["UPSTOX_CLIENT_ID"]
+CLIENT_SECRET = st.secrets["UPSTOX_CLIENT_SECRET"]
+REDIRECT_URI = st.secrets["UPSTOX_REDIRECT_URI"]
+
+
+# ==============================
+# SESSION MANAGER
+# ==============================
+
+class UpstoxSession:
+    """
+    Handles OAuth login, token exchange, and session persistence.
+    """
+
+    SESSION_KEY = "upstox_access_token"
+
+    @staticmethod
+    def is_authenticated() -> bool:
+        return UpstoxSession.SESSION_KEY in st.session_state
+
+    @staticmethod
+    def get_access_token() -> Optional[str]:
+        return st.session_state.get(UpstoxSession.SESSION_KEY)
+
+    @staticmethod
+    def logout() -> None:
+        if UpstoxSession.SESSION_KEY in st.session_state:
+            del st.session_state[UpstoxSession.SESSION_KEY]
+        st.rerun()
+
+    # ==========================
+    # LOGIN FLOW
+    # ==========================
+
+    @staticmethod
+    def get_login_url() -> str:
+        params = {
+            "response_type": "code",
+            "client_id": CLIENT_ID,
+            "redirect_uri": REDIRECT_URI
+        }
+        return f"{UPSTOX_AUTH_URL}?{urlencode(params)}"
+
+    @staticmethod
+    def exchange_code_for_token(code: str) -> str:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
+
+        data = {
+            "code": code,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code"
+        }
+
+        response = requests.post(
+            UPSTOX_TOKEN_URL,
+            headers=headers,
+            data=data,
+            timeout=10
+        )
+
+        response.raise_for_status()
+
+        token = response.json().get("access_token")
+        if not token:
+            raise RuntimeError("No access_token in Upstox response")
+
+        return token
+
+    # ==========================
+    # STREAMLIT ENTRYPOINT
+    # ==========================
+
+    @staticmethod
+    def authenticate() -> str:
+        """
+        Call this ONCE at the top of app.py.
+        Returns a valid access_token or halts execution.
+        """
+
+        # Already authenticated
+        if UpstoxSession.is_authenticated():
+            return UpstoxSession.get_access_token()
+
+        # Check redirect query params
+        query_params = st.query_params
+        if "code" in query_params:
+            try:
+                token = UpstoxSession.exchange_code_for_token(
+                    query_params["code"]
+                )
+                st.session_state[UpstoxSession.SESSION_KEY] = token
+
+                # Clean URL (remove ?code=...)
+                st.query_params.clear()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
+                st.stop()
+
+        # Not authenticated → show login
+        st.markdown(
+            f"""
+            ### 🔐 Login Required
+
+            [Click here to login with Upstox]({UpstoxSession.get_login_url()})
+            """
+        )
+        st.stop()
+
+
+# ===== FILE: data\instrument_master.py =====
+
+import gzip
+import json
+import requests
+from functools import lru_cache
+from io import BytesIO
+
+
+INSTRUMENT_MASTER_URL = (
+    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+)
+
+
+@lru_cache(maxsize=1)
+def load_instrument_master() -> dict:
+    """
+    Downloads NSE instrument master and returns:
+    { trading_symbol : instrument_key }
+    """
+
+    response = requests.get(INSTRUMENT_MASTER_URL, timeout=20)
+    response.raise_for_status()
+
+    # IMPORTANT: read full content into memory first
+    compressed_bytes = response.content
+    if not compressed_bytes:
+        raise RuntimeError("Instrument master download returned empty content")
+
+    try:
+        with gzip.GzipFile(fileobj=BytesIO(compressed_bytes)) as gz:
+            data = json.load(gz)
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse instrument master JSON: {e}")
+
+    instrument_map = {}
+
+    for item in data:
+        symbol = item.get("trading_symbol")
+        key = item.get("instrument_key")
+
+        if symbol and key:
+            instrument_map[symbol] = key
+
+    if not instrument_map:
+        raise RuntimeError("Instrument master parsed but mapping is empty")
+
+    return instrument_map
+
+import json
+import gzip
+from pathlib import Path
+
+
+INSTRUMENT_MASTER = Path("G:/trading_app/data/instruments.json.gz")
+
+
+def get_option_keys(
+    underlying: str,
+    expiry: str,
+    max_keys: int = 200
+) -> list[str]:
+    """
+    Return option instrument_keys for an index expiry.
+    """
+
+    if not INSTRUMENT_MASTER.exists():
+        raise FileNotFoundError("Instrument master not found")
+
+    expiry = expiry.replace("-", "")
+
+    keys = []
+
+    with gzip.open(INSTRUMENT_MASTER, "rt", encoding="utf-8") as f:
+        data = json.load(f)
+
+        for inst in data:
+            if (
+                inst.get("instrument_type") == "OPTIDX"
+                and inst.get("underlying") == underlying
+                and inst.get("expiry") == expiry
+            ):
+                keys.append(inst["instrument_key"])
+
+                if len(keys) >= max_keys:
+                    break
+
+    return keys
+
+
+def get_instrument_key(symbol: str) -> str:
+    instruments = load_instrument_master()
+
+    if symbol not in instruments:
+        raise KeyError(f"Instrument not found in master: {symbol}")
+
+    return instruments[symbol]
+
+
+# ===== FILE: data\upstox_client.py =====
+
+#upstox_client.py
+
+import requests
+import pandas as pd
+from typing import List, Dict, Optional
+import json
+
+
+BASE_URL = "https://api.upstox.com/v2"
+
+
+class UpstoxClient:
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}"
+        })
+    
+    def _make_request(self, method: str, endpoint: str, **kwargs):
+        """Helper method to make API requests with error handling"""
+        url = f"{BASE_URL}/{endpoint}"
+        
+        try:
+            response = self.session.request(method, url, **kwargs)
+            
+            # Debug info (comment out in production)
+            # print(f"Request: {method} {url}")
+            # print(f"Params: {kwargs.get('params', {})}")
+            # print(f"Status: {response.status_code}")
+            
+            if response.status_code != 200:
+                print(f"Error Response: {response.text}")
+            
+            response.raise_for_status()
+            return response.json()
+            
+        except requests.exceptions.HTTPError as e:
+            print(f"HTTP Error: {e}")
+            error_data = {}
+            try:
+                error_data = response.json()
+                print(f"Error Details: {json.dumps(error_data, indent=2)}")
+            except:
+                pass
+            raise
+        except Exception as e:
+            print(f"Request Error: {e}")
+            raise
+
+
+    # ==============================
+    # FETCH OPTION CHAIN (REAL)
+    # ==============================
+
+    def fetch_option_chain(
+        self,
+        option_keys: list[str]
+        ) -> pd.DataFrame:
+        """
+        Fetch and normalize option chain quotes.
+
+        Output columns (contract-compliant):
+        - strike
+        - option_type (CE / PE)
+        - oi
+        - oi_change
+        - iv
+        - ltp
+        """
+
+        if not option_keys:
+            return pd.DataFrame(
+                columns=["strike", "option_type", "oi", "oi_change", "iv", "ltp"]
+            )
+
+        data = self._make_request(
+            "GET",
+            "market-quote/quotes",
+            params={"instrument_key": ",".join(option_keys[:200])}
+        )
+
+        rows = []
+        for key, payload in data.get("data", {}).items():
+            symbol = payload.get("trading_symbol", "")
+
+            rows.append({
+                "strike": payload.get("strike_price"),
+                "option_type": "CE" if symbol.endswith("CE") else "PE",
+                "oi": payload.get("oi", 0),
+                "oi_change": payload.get("oi_day_high", 0) - payload.get("oi_day_low", 0),
+                "iv": payload.get("implied_volatility", 0),
+                "ltp": payload.get("last_price", 0)
+            })
+
+        return pd.DataFrame(rows)
+
+    # ==============================
+    # GET INDEX QUOTE (WORKING METHOD)
+    # ==============================
+    
+    def fetch_index_quote(self, symbol: str = "NSE_INDEX|Nifty 50") -> Optional[dict]:
+        """
+        Fetch index quote using Upstox API.
+        
+        Format: "NSE_INDEX|Index Name"
+        Example: "NSE_INDEX|Nifty 50"
+        """
+        
+        try:
+            data = self._make_request(
+                "GET",
+                "market-quote/quotes",
+                params={"symbol": symbol}
+            )
+            
+            # Check response structure
+            if data.get("status") == "success":
+                # The key in response uses colon instead of pipe
+                response_key = symbol.replace("|", ":")
+                
+                # Try both formats
+                quote_data = data.get("data", {}).get(response_key)
+                if not quote_data:
+                    # Try original symbol
+                    quote_data = data.get("data", {}).get(symbol)
+                
+                if not quote_data and data.get("data"):
+                    # Get first available symbol
+                    first_key = list(data["data"].keys())[0]
+                    quote_data = data["data"][first_key]
+                
+                if not quote_data:
+                    return None
+                
+                ohlc = quote_data.get("ohlc", {})
+                
+                return {
+                    "symbol": symbol,
+                    "ltp": quote_data.get("last_price"),
+                    "open": ohlc.get("open"),
+                    "high": ohlc.get("high"),
+                    "low": ohlc.get("low"),
+                    "close": ohlc.get("close"),
+                    "change": quote_data.get("change"),
+                    "net_change": quote_data.get("net_change"),
+                    "percent_change": quote_data.get("percent_change"),
+                    "volume": quote_data.get("volume"),
+                    "timestamp": quote_data.get("timestamp")
+                }
+            else:
+                print(f"API Error: {data}")
+                return None
+                
+        except Exception as e:
+            print(f"Error in fetch_index_quote: {e}")
+            return None
+    # ==============================
+    # FETCH EQUITY QUOTES (BATCH)
+    # ==============================
+
+    def fetch_equity_quotes(self, symbols: list[str]) -> pd.DataFrame:
+        """
+        Fetch equity quotes for NSE symbols and return a normalized DataFrame.
+
+        Output columns:
+        - symbol
+        - ltp
+        - open
+        """
+
+        if not symbols:
+            return pd.DataFrame(columns=["symbol", "ltp", "open"])
+
+        # Build NSE equity symbols
+        instrument_symbols = [f"NSE_EQ|{s}" for s in symbols]
+
+        data = self._make_request(
+            "GET",
+            "market-quote/quotes",
+            params={"symbol": ",".join(instrument_symbols)}
+        )
+
+        rows = []
+        for key, payload in data.get("data", {}).items():
+            ohlc = payload.get("ohlc", {})
+            symbol = payload.get("trading_symbol")
+
+            if symbol:
+                rows.append({
+                    "symbol": symbol.replace("-EQ", ""),
+                    "ltp": payload.get("last_price"),
+                    "open": ohlc.get("open")
+                })
+
+        return pd.DataFrame(rows)
+
+    # ==============================
+    # SIMPLER METHOD (just get index data)
+    # ==============================
+    
+    def get_index_data(self, index_name: str = "Nifty 50") -> Optional[dict]:
+        """
+        Simplified method to get index data.
+        """
+        symbol = f"NSE_INDEX|{index_name}"
+        return self.fetch_index_quote(symbol)
+    
+    # ==============================
+    # GET AVAILABLE INDICES
+    # ==============================
+    
+    def get_available_indices(self) -> List[str]:
+        """
+        Get list of available NSE indices.
+        """
+        indices = [
+            "NSE_INDEX|Nifty 50",
+            "NSE_INDEX|Nifty Bank",
+            "NSE_INDEX|Nifty Next 50",
+            "NSE_INDEX|Nifty Midcap 50",
+            "NSE_INDEX|Nifty Auto",
+            "NSE_INDEX|Nifty IT",
+            "NSE_INDEX|Nifty Pharma",
+            "NSE_INDEX|Nifty Metal",
+            "NSE_INDEX|Nifty Realty"
+        ]
+        
+        working_indices = []
+        for index in indices:
+            try:
+                data = self.fetch_index_quote(index)
+                if data and data.get("ltp") is not None:
+                    working_indices.append(index)
+            except:
+                continue
+        
+        # Always include at least Nifty 50 and Nifty Bank
+        if not working_indices:
+            working_indices = ["NSE_INDEX|Nifty 50", "NSE_INDEX|Nifty Bank"]
+        
+        return working_indices
+    
+    # ==============================
+    # TEST CONNECTION
+    # ==============================
+    
+    def test_connection(self) -> bool:
+        """
+        Test if the API connection works.
+        """
+        try:
+            data = self.get_index_data("Nifty 50")
+            return data is not None and data.get("ltp") is not None
+        except:
+            return False
+
+# ===== FILE: features\breadth.py =====
+
+import pandas as pd
+import numpy as np
+
+
+# ==============================
+# CCC VALUE
+# ==============================
+
+def compute_ccc_value(
+    constituents_df: pd.DataFrame,
+    weight_col: str = "weight",
+    price_change_col: str = "price_change"
+) -> float:
+    """
+    Compute Cumulative Constituent Contribution (CCC).
+
+    constituents_df must contain:
+    - weight : index weight of the stock (sums to ~1.0)
+    - price_change : normalized price change
+                     (e.g. (LTP - OPEN) / OPEN)
+
+    CCC = Σ (weight * price_change)
+    """
+
+    if constituents_df.empty:
+        return 0.0
+
+    required_cols = {weight_col, price_change_col}
+    if not required_cols.issubset(constituents_df.columns):
+        raise ValueError(
+            f"Missing required columns: {required_cols - set(constituents_df.columns)}"
+        )
+
+    ccc = (constituents_df[weight_col] * constituents_df[price_change_col]).sum()
+    return float(ccc)
+
+# ==============================
+# BUILD CCC INPUT (REAL)
+# ==============================
+
+def build_constituents_df(
+    equity_quotes_df: pd.DataFrame,
+    weights: dict
+) -> pd.DataFrame:
+    """
+    Builds constituents_df with:
+    - weight
+    - price_change = (LTP - OPEN) / OPEN
+    """
+
+    rows = []
+
+    for _, row in equity_quotes_df.iterrows():
+        symbol = row["symbol"]
+        if symbol not in weights:
+            continue
+
+        open_price = row["open"]
+        ltp = row["ltp"]
+
+        if not open_price or open_price == 0:
+            continue
+
+        price_change = (ltp - open_price) / open_price
+
+        rows.append({
+            "weight": weights[symbol],
+            "price_change": price_change
+        })
+
+    return pd.DataFrame(rows)
+
+# ==============================
+# CCC SLOPE
+# ==============================
+
+def compute_ccc_slope(
+    ccc_series: pd.Series,
+    lookback: int = 5
+) -> float:
+    """
+    Compute slope of CCC over last N points.
+
+    Positive slope -> improving breadth
+    Negative slope -> weakening breadth
+    """
+
+    if len(ccc_series) <= lookback:
+        return 0.0
+
+    y = ccc_series.iloc[-lookback:]
+    x = np.arange(len(y))
+
+    slope = np.polyfit(x, y, 1)[0]
+    return float(slope)
+
+
+# ==============================
+# FEATURE AGGREGATOR
+# ==============================
+
+def compute_breadth_features(
+    constituents_df: pd.DataFrame,
+    ccc_history: pd.Series
+) -> dict:
+    """
+    Returns ONLY feature-contract-compliant keys.
+    """
+
+    ccc_value = compute_ccc_value(constituents_df)
+    ccc_slope = compute_ccc_slope(ccc_history)
+
+    return {
+        "ccc_value": ccc_value,
+        "ccc_slope": ccc_slope
+    }
+
+
+# ===== FILE: features\option_features.py =====
+
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+
+# ==============================
+# PUT CALL RATIO
+# ==============================
+
+def compute_put_call_ratio(option_chain_df: pd.DataFrame) -> float:
+    put_oi = option_chain_df.loc[
+        option_chain_df["option_type"] == "PE", "oi"
+    ].sum()
+
+    call_oi = option_chain_df.loc[
+        option_chain_df["option_type"] == "CE", "oi"
+    ].sum()
+
+    if call_oi == 0:
+        return 0.0
+
+    return float(put_oi / call_oi)
+
+
+# ==============================
+# OI DELTA (NET FLOW)
+# ==============================
+
+def compute_oi_delta(option_chain_df: pd.DataFrame) -> float:
+    put_delta = option_chain_df.loc[
+        option_chain_df["option_type"] == "PE", "oi_change"
+    ].sum()
+
+    call_delta = option_chain_df.loc[
+        option_chain_df["option_type"] == "CE", "oi_change"
+    ].sum()
+
+    return float(put_delta - call_delta)
+
+
+# ==============================
+# OI CONCENTRATION
+# ==============================
+
+def compute_oi_concentration(option_chain_df: pd.DataFrame) -> float:
+    total_oi = option_chain_df["oi"].sum()
+    if total_oi == 0:
+        return 0.0
+
+    max_strike_oi = (
+        option_chain_df
+        .groupby("strike")["oi"]
+        .sum()
+        .max()
+    )
+
+    return float(max_strike_oi / total_oi)
+
+
+# ==============================
+# ATM IMPLIED VOLATILITY
+# ==============================
+
+def compute_atm_iv(option_chain_df: pd.DataFrame, spot_price: float) -> float:
+    option_chain_df = option_chain_df.copy()
+    option_chain_df["dist"] = abs(option_chain_df["strike"] - spot_price)
+
+    atm_row = option_chain_df.sort_values("dist").iloc[0]
+    iv = atm_row["iv"]
+
+    return float(iv) if not np.isnan(iv) else 0.0
+
+
+# ==============================
+# IV SKEW (CALL - PUT)
+# ==============================
+
+def compute_iv_skew(option_chain_df: pd.DataFrame, spot_price: float) -> float:
+    option_chain_df = option_chain_df.copy()
+    option_chain_df["dist"] = abs(option_chain_df["strike"] - spot_price)
+
+    atm = option_chain_df.sort_values("dist").head(2)
+
+    ce_iv = atm.loc[atm["option_type"] == "CE", "iv"].mean()
+    pe_iv = atm.loc[atm["option_type"] == "PE", "iv"].mean()
+
+    if np.isnan(ce_iv) or np.isnan(pe_iv):
+        return 0.0
+
+    return float(ce_iv - pe_iv)
+
+
+# ==============================
+# TIME TO EXPIRY (MINUTES)
+# ==============================
+
+def compute_time_to_expiry_minutes(expiry_datetime: datetime) -> int:
+    now = datetime.utcnow()
+    delta = expiry_datetime - now
+
+    minutes = int(delta.total_seconds() / 60)
+    return max(minutes, 0)
+
+
+# ==============================
+# FEATURE AGGREGATOR
+# ==============================
+
+def compute_option_features(
+    option_chain_df: pd.DataFrame,
+    spot_price: float,
+    expiry_datetime: datetime
+) -> dict:
+    """
+    Returns ONLY feature-contract-compliant keys.
+    """
+
+    return {
+        "put_call_ratio": compute_put_call_ratio(option_chain_df),
+        "oi_delta": compute_oi_delta(option_chain_df),
+        "oi_concentration": compute_oi_concentration(option_chain_df),
+        "atm_iv": compute_atm_iv(option_chain_df, spot_price),
+        "iv_skew": compute_iv_skew(option_chain_df, spot_price),
+        "time_to_expiry_minutes": compute_time_to_expiry_minutes(expiry_datetime)
+    }
+
+
+# ===== FILE: features\price_features.py =====
+
+import pandas as pd
+import numpy as np
+
+
+# ==============================
+# VWAP DISTANCE
+# ==============================
+
+def compute_vwap_distance(ltp: float, vwap: float) -> float:
+    """
+    (LTP - VWAP) / VWAP
+    Positive -> price above VWAP (bullish)
+    Negative -> price below VWAP (bearish)
+    """
+    if vwap == 0:
+        return 0.0
+
+    return float((ltp - vwap) / vwap)
+
+
+# ==============================
+# PRICE MOMENTUM
+# ==============================
+
+def compute_price_momentum(
+    price_series: pd.Series,
+    lookback: int = 5
+) -> float:
+    """
+    Normalized momentum over last N bars.
+
+    price_series:
+        ordered series of prices (oldest → newest)
+
+    lookback:
+        number of bars to look back
+    """
+    if len(price_series) <= lookback:
+        return 0.0
+
+    past_price = price_series.iloc[-lookback - 1]
+    current_price = price_series.iloc[-1]
+
+    if past_price == 0:
+        return 0.0
+
+    return float((current_price - past_price) / past_price)
+
+
+# ==============================
+# VOLUME RATIO
+# ==============================
+
+def compute_volume_ratio(
+    volume_series: pd.Series,
+    lookback: int = 20
+) -> float:
+    """
+    Current volume / average volume over lookback window.
+    """
+    if len(volume_series) < lookback:
+        return 0.0
+
+    current_volume = volume_series.iloc[-1]
+    avg_volume = volume_series.iloc[-lookback:].mean()
+
+    if avg_volume == 0:
+        return 0.0
+
+    return float(current_volume / avg_volume)
+
+
+# ==============================
+# FEATURE AGGREGATOR
+# ==============================
+
+def compute_price_features(
+    ltp: float,
+    vwap: float,
+    price_series: pd.Series,
+    volume_series: pd.Series
+) -> dict:
+    """
+    Returns ONLY feature-contract-compliant keys.
+    """
+
+    return {
+        "vwap_distance": compute_vwap_distance(ltp, vwap),
+        "price_momentum": compute_price_momentum(price_series),
+        "volume_ratio": compute_volume_ratio(volume_series),
+    }
+
+
+# ===== FILE: intelligence\market_state.py =====
+
+
+
+# ===== FILE: intelligence\signal_logic.py =====
+
+
+
+# ===== FILE: ml\feature_contract.py =====
+
+"""
+SINGLE SOURCE OF TRUTH FOR FEATURES
+Used by:
+- Live data collection
+- ML training
+- ML inference
+- Backtesting
+"""
+
+FEATURE_VERSION = "v1.0"
+
+FEATURE_COLUMNS = [
+    "timestamp",
+
+    # Option structure
+    "put_call_ratio",
+    "oi_delta",
+    "oi_concentration",
+    "atm_iv",
+    "iv_skew",
+
+    # Price & flow
+    "vwap_distance",
+    "price_momentum",
+    "volume_ratio",
+
+    # Breadth
+    "ccc_value",
+    "ccc_slope",
+
+    # Time context
+    "time_to_expiry_minutes"
+]
+
+TARGET_COLUMN = "future_return_5m"
+
+PRIMARY_KEYS = [
+    "timestamp"
+]
+
+
+# ===== FILE: ml\inference.py =====
+
+
+
+# ===== FILE: ml\training.py =====
+
+
+
+# ===== FILE: risk\position_sizing.py =====
+
+
+
+# ===== FILE: risk\stoploss.py =====
+
+
+
+# ===== FILE: storage\repository.py =====
+
+import sqlite3
+from typing import Dict, Optional
+import pandas as pd
+from pathlib import Path
+
+# =========================
+# DATABASE CONFIG
+# =========================
+
+DB_PATH = Path("G:/trading_app/storage/trading.db")
+
+# Ensure directory exists
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+# =========================
+# CONNECTION HANDLING
+# =========================
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    print("DB PATH USED BY REPOSITORY:", DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# =========================
+# FEATURE STORE OPERATIONS
+# =========================
+
+def insert_market_features(df: pd.DataFrame) -> None:
+    """
+    Insert feature rows into market_features table.
+
+    Expectations:
+    - df columns EXACTLY match feature_contract.FEATURE_COLUMNS
+      + ['feature_version']
+      + optionally ['future_return_5m']
+    - Append-only (no updates)
+    """
+    if df.empty:
+        return
+
+    with get_connection() as conn:
+        df.to_sql(
+            name="market_features",
+            con=conn,
+            if_exists="append",
+            index=False
+        )
+
+
+def fetch_latest_features(feature_version: str) -> Optional[pd.DataFrame]:
+    """
+    Fetch the most recent feature row for inference.
+    """
+    query = """
+        SELECT *
+        FROM market_features
+        WHERE feature_version = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """
+
+    with get_connection() as conn:
+        df = pd.read_sql_query(query, conn, params=(feature_version,))
+
+    if df.empty:
+        return None
+
+    return df
+# ==============================
+# SIGNAL STORAGE
+# ==============================
+
+def insert_signal(signal: dict):
+    import sqlite3
+    from pathlib import Path
+
+    db = Path("G:/trading_app/storage/trading.db")
+
+    with sqlite3.connect(db) as conn:
+        cols = ", ".join(signal.keys())
+        placeholders = ", ".join(["?"] * len(signal))
+        values = list(signal.values())
+
+        conn.execute(
+            f"INSERT INTO signals ({cols}) VALUES ({placeholders})",
+            values
+        )
+        conn.commit()
+
+
+def fetch_training_data(
+    feature_version: str,
+    start_ts: str,
+    end_ts: str
+) -> pd.DataFrame:
+    """
+    Fetch labeled data for ML training / backtesting.
+    """
+    query = """
+        SELECT *
+        FROM market_features
+        WHERE feature_version = ?
+          AND timestamp BETWEEN ? AND ?
+          AND future_return_5m IS NOT NULL
+        ORDER BY timestamp ASC
+    """
+
+    with get_connection() as conn:
+        df = pd.read_sql_query(
+            query,
+            conn,
+            params=(feature_version, start_ts, end_ts)
+        )
+
+    return df
+
+
+# =========================
+# SIGNAL STORE OPERATIONS
+# =========================
+
+def insert_signal(signal: Dict) -> None:
+    """
+    Insert a trading signal into signals table.
+
+    Required keys in signal dict:
+    - signal_id
+    - timestamp
+    - feature_version
+    - model_version
+    - signal_type
+    - confidence
+    - market_state
+    - rationale
+    - expiry_time
+    - status
+    - created_at
+    """
+    query = """
+        INSERT INTO signals (
+            signal_id,
+            timestamp,
+            feature_version,
+            model_version,
+            signal_type,
+            confidence,
+            market_state,
+            rationale,
+            expiry_time,
+            status,
+            created_at
+        )
+        VALUES (
+            :signal_id,
+            :timestamp,
+            :feature_version,
+            :model_version,
+            :signal_type,
+            :confidence,
+            :market_state,
+            :rationale,
+            :expiry_time,
+            :status,
+            :created_at
+        )
+    """
+
+    with get_connection() as conn:
+        conn.execute(query, signal)
+        conn.commit()
+
+# ==============================
+# SIGNAL DUPLICATE CHECK
+# ==============================
+
+def signal_exists(feature_timestamp: str) -> bool:
+    import sqlite3
+    from pathlib import Path
+
+    db = Path("G:/trading_app/storage/trading.db")
+
+    with sqlite3.connect(db) as conn:
+        cur = conn.execute(
+            "SELECT 1 FROM signals WHERE timestamp = ? LIMIT 1",
+            (feature_timestamp,)
+        )
+        return cur.fetchone() is not None
+
+# ==============================
+# SIGNAL LIFECYCLE MANAGEMENT
+# ==============================
+
+def validate_new_signals(confidence_threshold: float = 0.2):
+    """
+    Promote NEW signals to VALIDATED if confidence is sufficient.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    db = Path("G:/trading_app/storage/trading.db")
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            UPDATE signals
+            SET status = 'VALIDATED'
+            WHERE status = 'NEW'
+              AND confidence >= ?
+            """,
+            (confidence_threshold,)
+        )
+        conn.commit()
+
+
+def expire_old_signals():
+    """
+    Expire VALIDATED signals whose expiry_time has passed.
+    """
+    import sqlite3
+    from pathlib import Path
+    from datetime import datetime
+
+    db = Path("G:/trading_app/storage/trading.db")
+    now = datetime.utcnow().isoformat()
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            UPDATE signals
+            SET status = 'EXPIRED'
+            WHERE status = 'VALIDATED'
+              AND expiry_time < ?
+            """,
+            (now,)
+        )
+        conn.commit()
+
+def update_signal_status(signal_id: str, new_status: str) -> None:
+    """
+    Update signal lifecycle status.
+    Allowed transitions enforced at logic layer (not here).
+    """
+    query = """
+        UPDATE signals
+        SET status = ?
+        WHERE signal_id = ?
+    """
+
+    with get_connection() as conn:
+        conn.execute(query, (new_status, signal_id))
+        conn.commit()
+
+
+# =========================
+# MODEL REGISTRY
+# =========================
+
+def register_model(model_info: Dict) -> None:
+    """
+    Register trained ML model metadata.
+
+    Required keys:
+    - model_version
+    - feature_version
+    - algorithm
+    - trained_on_start
+    - trained_on_end
+    - metrics_json
+    - created_at
+    """
+    query = """
+        INSERT INTO model_registry (
+            model_version,
+            feature_version,
+            algorithm,
+            trained_on_start,
+            trained_on_end,
+            metrics_json,
+            created_at
+        )
+        VALUES (
+            :model_version,
+            :feature_version,
+            :algorithm,
+            :trained_on_start,
+            :trained_on_end,
+            :metrics_json,
+            :created_at
+        )
+    """
+
+    with get_connection() as conn:
+        conn.execute(query, model_info)
+        conn.commit()
+
+
+def fetch_active_model(feature_version: str) -> Optional[Dict]:
+    """
+    Fetch the latest model for a given feature version.
+    """
+    query = """
+        SELECT *
+        FROM model_registry
+        WHERE feature_version = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+    """
+
+    with get_connection() as conn:
+        row = conn.execute(query, (feature_version,)).fetchone()
+
+    return dict(row) if row else None
+
+
+# =========================
+# SYSTEM HEALTH LOGGING
+# =========================
+
+def log_system_health(
+    timestamp: str,
+    component: str,
+    status: str,
+    message: Optional[str] = None
+) -> None:
+    query = """
+        INSERT INTO system_health (
+            timestamp,
+            component,
+            status,
+            message
+        )
+        VALUES (?, ?, ?, ?)
+    """
+
+    with get_connection() as conn:
+        conn.execute(query, (timestamp, component, status, message))
+        conn.commit()
+
+
+# ===== FILE: ui\charts.py =====
+
+
+
+# ===== FILE: ui\heatmap.py =====
+
+
+
+# ===== FILE: ui\option_chain.py =====
+
+
+
+# ===== FILE: ui\signals.py =====
+
+
+
+# ===== FILE: core\signals\state_machine.py =====
+
+from datetime import datetime, timedelta
+import uuid
+import pandas as pd
+
+
+class SignalStateMachine:
+    """
+    Deterministic signal generator with lifecycle control.
+    """
+
+    def __init__(
+        self,
+        signal_expiry_minutes: int = 5
+    ):
+        self.signal_expiry_minutes = signal_expiry_minutes
+
+    # ==============================
+    # SIGNAL DECISION
+    # ==============================
+
+    def decide(self, feature_row: pd.Series) -> dict:
+        """
+        Score-based signal decision (v2).
+        Increases trade frequency while remaining robust.
+        """
+
+        score = 0
+
+        # Price momentum
+        if feature_row["price_momentum"] > 0:
+            score += 1
+        elif feature_row["price_momentum"] < 0:
+            score -= 1
+
+        # Breadth (CCC slope)
+        if feature_row["ccc_slope"] > 0:
+            score += 1
+        elif feature_row["ccc_slope"] < 0:
+            score -= 1
+
+        # Options flow
+        if feature_row["oi_delta"] > 0:
+            score += 1
+        elif feature_row["oi_delta"] < 0:
+            score -= 1
+
+        # Sentiment (PCR inverted)
+        if feature_row["put_call_ratio"] < 1.0:
+            score += 1
+        elif feature_row["put_call_ratio"] > 1.0:
+            score -= 1
+
+        # Decision
+        if score >= 2:
+            signal_type = "BUY"
+        elif score <= -2:
+            signal_type = "SELL"
+        else:
+            signal_type = "NEUTRAL"
+
+        confidence = min(1.0, abs(score) / 4)
+
+        return {
+            "signal_type": signal_type,
+            "confidence": round(confidence, 3)
+        }
+
+
+    # ==============================
+    # SIGNAL OBJECT
+    # ==============================
+
+    def build_signal(
+        self,
+        feature_row: pd.Series,
+        model_version: str = "rules_v1"
+    ) -> dict:
+        """
+        Build full signal record.
+        """
+
+        decision = self.decide(feature_row)
+
+        now = datetime.utcnow()
+
+        return {
+            "signal_id": str(uuid.uuid4()),
+            "timestamp": feature_row["timestamp"],
+            "feature_version": feature_row["feature_version"],
+            "model_version": model_version,
+
+            "signal_type": decision["signal_type"],
+            "confidence": decision["confidence"],
+
+            "market_state": "TRENDING" if decision["confidence"] > 0 else "NEUTRAL",
+            "rationale": "rule_based_v1",
+
+            "expiry_time": (now + timedelta(minutes=self.signal_expiry_minutes)).isoformat(),
+            "status": "NEW",
+
+            "created_at": now.isoformat()
+        }
